@@ -5,56 +5,88 @@ import core.memory;
 import core.stdc.errno;
 import core.stdc.stdint;
 import core.stdc.stdlib;
-import core.sys.linux.elf;
-import core.sys.linux.link;
 import core.sys.posix.sys.mman;
 import std.algorithm;
 import std.conv;
 import std.experimental.allocator;
 import std.experimental.allocator.mallocator;
 import std.experimental.allocator.mmap_allocator;
+import std.functional;
 import std.mmfile;
 import std.path;
 import std.random;
 import std.range;
-import std.stdio;
 import std.string;
 import std.traits;
 
-public struct AndroidLibrary {
-    package MmFile elfFile;
-    package void[] allocation;
+import slf4d;
 
-    package char[] sectionNamesTable;
-    package char[] dynamicStringTable;
-    package ElfW!"Sym"[] dynamicSymbolTable;
-    package SymbolHashTable hashTable;
+import std_edit.elf;
+import std_edit.link;
+import provision.compat.windows;
 
-    public this(string libraryName) {
+public class AndroidLibrary {
+    MmFile elfFile;
+    void[] allocation;
+    size_t shift;
+
+    char[] sectionNamesTable;
+    char[] dynamicStringTable;
+    ElfW!"Sym"[] dynamicSymbolTable;
+    SymbolHashTable hashTable;
+    AndroidLibrary[] loadedLibraries;
+
+    version (StubMaps) {
+        void[][] stubMaps;
+        size_t currentMapOffset = 0;
+    }
+
+    public void*[string] hooks;
+
+    private ElfW!"Shdr"[] relocationSections;
+
+    public this(string libraryName, void*[string] hooks = null) {
+        auto log = getLogger();
+
         elfFile = new MmFile(libraryName);
+        if (hooks) this.hooks = hooks;
 
         auto elfHeader = elfFile.identify!(ElfW!"Ehdr")(0);
         auto programHeaders = elfFile.identifyArray!(ElfW!"Phdr")(elfHeader.e_phoff, elfHeader.e_phnum);
 
         size_t minimum = size_t.max;
-        size_t maximumFile = size_t.min;
         size_t maximumMemory = size_t.min;
 
         size_t headerStart;
         size_t headerEnd;
         size_t headerMemoryEnd;
 
+        shift = 0;
+        int adjacentProtection = 0;
+
+        log.traceF!"Page size: 0x%x"(pageSize);
+
+        enum originalPageSize = 0x1000;
         foreach (programHeader; programHeaders) {
             if (programHeader.p_type == PT_LOAD) {
                 headerStart = programHeader.p_vaddr;
                 headerEnd = programHeader.p_vaddr + programHeader.p_filesz;
                 headerMemoryEnd = programHeader.p_vaddr + programHeader.p_memsz;
 
+                if (pageSize > originalPageSize && (adjacentProtection | programHeader.p_flags) == (PF_R | PF_W | PF_X)) {
+                    if (shift) {
+                        throw new LoaderException("Cannot load the library on your system! The page size is too big!");
+                    }
+                    shift = ((pageCeil(headerStart) - headerStart) + originalPageSize - 1) & ~(originalPageSize - 1);
+                    log.traceF!"Mandating a shift of %d to hopefully fix page size."(shift);
+                    adjacentProtection = 0;
+                }
+                log.traceF!"Program header protection: %b"(programHeader.p_flags);
+
+                adjacentProtection |= programHeader.p_flags;
+
                 if (headerStart < minimum) {
                     minimum = headerStart;
-                }
-                if (headerEnd > maximumFile) {
-                    maximumFile = headerEnd;
                 }
                 if (headerMemoryEnd > maximumMemory) {
                     maximumMemory = headerMemoryEnd;
@@ -66,12 +98,9 @@ public struct AndroidLibrary {
         auto alignedMaximumMemory = pageCeil(maximumMemory);
 
         auto allocSize = alignedMaximumMemory - alignedMinimum;
-        auto mmapped_alloc = mmap(null, allocSize, PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (mmapped_alloc == MAP_FAILED) {
-            throw new LoaderException("Cannot allocate the memory: " ~ to!string(errno));
-        }
-        allocation = mmapped_alloc[0..allocSize];
+        allocation = MmapAllocator.instance.allocate(allocSize + shift)[shift..$];
+        memoryTable[MemoryBlock(cast(size_t) allocation.ptr, cast(size_t) allocation.ptr + allocSize)] = this;
+        log.traceF!"Allocating 0x%x - 0x%x for %s (shifted by %d)"(cast(size_t) allocation.ptr, cast(size_t) allocation.ptr + allocSize, libraryName, shift);
 
         size_t fileStart;
         size_t fileEnd;
@@ -83,9 +112,20 @@ public struct AndroidLibrary {
                 fileStart = programHeader.p_offset;
                 fileEnd = programHeader.p_offset + programHeader.p_filesz;
 
+                auto protectionResult = mprotect(cast(void*) pageFloor(cast(size_t) allocation.ptr + headerStart), pageCeil(cast(size_t) allocation.ptr + programHeader.p_vaddr + programHeader.p_memsz) - pageFloor(cast(size_t) allocation.ptr + headerStart), PROT_READ | PROT_WRITE);
+
+                if (protectionResult != 0) {
+                    throw new LoaderException("Cannot protect the memory correctly.");
+                }
+
+                log.traceF!"Program header alloc: %x - %x"(allocation.ptr + headerStart - alignedMinimum, allocation.ptr + headerEnd - alignedMinimum);
                 allocation[headerStart - alignedMinimum..headerEnd - alignedMinimum] = elfFile[fileStart..fileEnd];
 
-                auto protectionResult = mprotect(allocation.ptr + pageFloor(headerStart), pageCeil(headerEnd) - pageFloor(headerStart), programHeader.memoryProtection());
+                log.traceF!"Program header protection: %b"(programHeader.p_flags);
+                auto prot = programHeader.memoryProtection();
+                protectionResult = mprotect(cast(void*) pageFloor(cast(size_t) allocation.ptr + headerStart), pageCeil(cast(size_t) allocation.ptr + programHeader.p_vaddr + programHeader.p_memsz) - pageFloor(cast(size_t) allocation.ptr + headerStart), prot
+                    // | PROT_READ | PROT_WRITE | PROT_EXEC
+                );
 
                 if (protectionResult != 0) {
                     throw new LoaderException("Cannot protect the memory correctly.");
@@ -93,6 +133,7 @@ public struct AndroidLibrary {
             }
         }
 
+        log.trace("Parsing sections");
         auto sectionHeaders = elfFile.identifyArray!(ElfW!"Shdr")(elfHeader.e_shoff, elfHeader.e_shnum);
         auto sectionStrTable = sectionHeaders[elfHeader.e_shstrndx];
         sectionNamesTable = cast(char[]) elfFile[sectionStrTable.sh_offset..sectionStrTable.sh_offset + sectionStrTable.sh_size];
@@ -116,9 +157,11 @@ public struct AndroidLibrary {
                     break;
                 case SHT_REL:
                     this.relocate!(ElfW!"Rel")(sectionHeader);
+                    relocationSections ~= sectionHeader;
                     break;
                 case SHT_RELA:
                     this.relocate!(ElfW!"Rela")(sectionHeader);
+                    relocationSections ~= sectionHeader;
                     break;
                 default:
                     break;
@@ -127,12 +170,75 @@ public struct AndroidLibrary {
     }
 
     ~this() {
+        foreach (library; loadedLibraries) {
+            destroy(library);
+        }
+
+        version (StubMaps) {
+            foreach (stubMap; stubMaps) {
+                MmapAllocator.instance.deallocate(stubMap);
+            }
+
+            if (stubMaps) {
+                destroy(stubMaps);
+            }
+        }
+
         if (allocation) {
-            munmap(allocation.ptr, allocation.length);
+            auto memBlock = MemoryBlock(cast(size_t) allocation.ptr, cast(size_t) allocation.ptr + allocation.length);
+            if (memBlock in memoryTable) {
+                memoryTable.remove(memBlock);
+            }
+            MmapAllocator.instance.deallocate((allocation.ptr - shift)[0..allocation.length + shift]);
+        }
+
+        if (allocation) {
+            destroy(allocation);
+        }
+
+        if (relocationSections) {
+            destroy(relocationSections);
+        }
+
+        if (sectionNamesTable) {
+            destroy(sectionNamesTable);
+        }
+
+        if (dynamicStringTable) {
+            destroy(dynamicStringTable);
+        }
+
+        if (dynamicSymbolTable) {
+            destroy(dynamicSymbolTable);
+        }
+
+        if (hashTable) {
+            destroy(hashTable);
+        }
+
+        if (loadedLibraries) {
+            destroy(loadedLibraries);
+        }
+
+        if (hooks) {
+            destroy(hooks);
         }
     }
 
-    @disable this(this);
+    public void relocate() {
+        foreach (relocationSection; relocationSections) {
+            switch (relocationSection.sh_type) {
+                case SHT_REL:
+                    this.relocate!(ElfW!"Rel")(relocationSection);
+                    break;
+                case SHT_RELA:
+                    this.relocate!(ElfW!"Rela")(relocationSection);
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
 
     private void relocate(RelocationType)(ref ElfW!"Shdr" shdr) {
         auto relocations = this.elfFile.identifyArray!(RelocationType)(shdr.sh_offset, shdr.sh_size / RelocationType.sizeof);
@@ -153,7 +259,7 @@ public struct AndroidLibrary {
                     addend = *cast(size_t*) (cast(size_t) allocation.ptr + offset);
                 }
             }
-            auto symbol = getSymbolImplementation(getSymbolName(dynamicSymbolTable[symbolIndex]));
+            auto symbol = getSymbolImplementation(&dynamicStringTable[dynamicSymbolTable[symbolIndex].st_name]);
 
             auto location = cast(size_t*) (cast(size_t) allocation.ptr + offset);
 
@@ -176,6 +282,42 @@ public struct AndroidLibrary {
         }
     }
 
+    version (StubMaps) {
+        private void* buildStub(char* name) {
+            version (X86_64) {
+                ubyte[] code = buildStubCode(name);
+                if (stubMaps.length == 0 || currentMapOffset + code.length > stubMaps[$ - 1].length) {
+                    stubMaps ~= MmapAllocator.instance.allocate(pageSize);
+                    currentMapOffset = 0;
+                }
+
+                void[] currentStubMap = stubMaps[$ - 1];
+
+                mprotect(currentStubMap.ptr, currentStubMap.length, PROT_READ | PROT_WRITE);
+                currentStubMap[currentMapOffset..currentMapOffset + code.length] = code;
+                mprotect(currentStubMap.ptr, currentStubMap.length, PROT_READ | PROT_EXEC);
+
+                void* address = &currentStubMap[currentMapOffset];
+                currentMapOffset += code.length;
+                return address;
+            } else {
+                import provision.symbols;
+                return &undefinedSymbol;
+            }
+        }
+
+        private ubyte[] buildStubCode(char* name) {
+            // generates x86_64 assembler code for `undefinedSymbol(name)`
+            // it's never going to return back so we don't care about not saving registers.
+            import provision.symbols;
+            return [
+                ub!0x48, ub!0xBF, ] ~ name.ubytes() ~ [ // mov name %rdi
+                ub!0x48, ub!0xB8, ] ~ (&undefinedSymbol).ubytes() ~ [ // mov &undefinedSymbol %rax
+                ub!0xFF, ub!0xE0 // jmp *%rax
+            ];
+        }
+    }
+
     private string getSymbolName(ElfW!"Sym" symbol) {
         return cast(string) fromStringz(&dynamicStringTable[symbol.st_name]);
     }
@@ -184,10 +326,29 @@ public struct AndroidLibrary {
         return cast(string) fromStringz(&sectionNamesTable[section.sh_name]);
     }
 
+    void* getSymbolImplementation(char* name) {
+        string symbolName = cast(string) name.fromStringz();
+        void** hook = symbolName in hooks;
+        if (hook) {
+            return *hook;
+        }
+
+        import provision.symbols;
+        auto sym = lookupSymbol(symbolName);
+        version (StubMaps) {
+            if (!sym)
+                sym = buildStub(name);
+        } else {
+            if (!sym)
+                sym = &undefinedSymbol;
+        }
+        return sym;
+    }
+
     void* load(string symbolName) {
         ElfW!"Sym" sym;
         if (hashTable) {
-            sym = hashTable.lookup(symbolName, &this);
+            sym = hashTable.lookup(symbolName, this);
         } else {
             foreach (symbol; dynamicSymbolTable) {
                 if (getSymbolName(symbol) == symbolName) {
@@ -200,8 +361,54 @@ public struct AndroidLibrary {
     }
 }
 
+private struct MemoryBlock {
+    size_t start;
+    size_t end;
+}
+
+private __gshared AndroidLibrary[MemoryBlock] memoryTable;
+AndroidLibrary memoryOwner(size_t address) {
+    foreach(memoryBlock; memoryTable.keys()) {
+        if (address > memoryBlock.start && address < memoryBlock.end) {
+            return memoryTable[memoryBlock];
+        }
+    }
+
+    getLogger().error("Cannot find the parent library! Expect bugs!");
+    return null;
+}
+
+version (linux) {
+    import core.sys.linux.execinfo;
+    pragma(inline, true) AndroidLibrary rootLibrary() {
+        enum MAXFRAMES = 4;
+        void*[MAXFRAMES] callstack;
+        auto numframes = backtrace(callstack.ptr, MAXFRAMES);
+        return memoryOwner(cast(size_t) callstack[numframes - 1]);
+    }
+} else version (LDC) { // Seems to work consistently, but LLVM only.
+    pragma(LDC_intrinsic, "llvm.returnaddress")
+    ubyte* return_address(int);
+
+    import core.sys.windows.stacktrace;
+    pragma(inline, true) AndroidLibrary rootLibrary(ubyte* address = return_address(0)) {
+        assert(address != null);
+        return memoryOwner(cast(size_t) address);
+    }
+} else version (Windows) { // Works on a real Windows machine, but not Wine
+    import core.sys.windows.stacktrace;
+    pragma(inline, true) AndroidLibrary rootLibrary() {
+        auto callstack = StackTrace.trace();
+        auto address = cast(size_t) callstack[$ - 1];
+        assert(address != 0);
+        return memoryOwner(address);
+    }
+} else {
+    static assert(false, "Unsupported platform.");
+}
+
 interface SymbolHashTable {
-    ElfW!"Sym" lookup(string symbolName, AndroidLibrary* library);
+    ElfW!"Sym" lookup(string symbolName, AndroidLibrary library);
 }
 
 package class ElfHashTable: SymbolHashTable {
@@ -227,17 +434,14 @@ package class ElfHashTable: SymbolHashTable {
         uint h = 0, g;
 
         foreach (c; name) {
-            h = (h << 4) + c;
-            if ((g = h & 0xf0000000) != 0) {
-                h ^= g >> 24;
-            }
-            h &= ~g;
+            h = 16 * h + c;
+            h ^= h >> 24 & 0xf0;
         }
 
-        return h;
+        return h & 0xfffffff;
     }
 
-    ElfW!"Sym" lookup(string symbolName, AndroidLibrary* library) {
+    ElfW!"Sym" lookup(string symbolName, AndroidLibrary library) {
         auto targetHash = hash(symbolName);
 
         scope ElfW!"Sym" symbol;
@@ -285,7 +489,7 @@ package class GnuHashTable: SymbolHashTable {
         return h;
     }
 
-    ElfW!"Sym" lookup(string symbolName, AndroidLibrary* library) {
+    ElfW!"Sym" lookup(string symbolName, AndroidLibrary library) {
         auto targetHash = hash(symbolName);
         auto bucket = buckets[targetHash % table.nbuckets];
 
@@ -358,6 +562,14 @@ template R_GENERIC(string relocationType) {
     enum R_GENERIC = mixin("R_" ~ relocationArch ~ "_" ~ relocationType);
 }
 
+template ub(ubyte a) {
+    enum ub = a;
+}
+
+ubyte[T.sizeof] ubytes(T)(T val) {
+    return *cast(ubyte[T.sizeof]*) &val;
+}
+
 size_t pageFloor(size_t number) {
     return number & pageMask;
 }
@@ -378,11 +590,6 @@ RetType reinterpret(RetType, FromType)(FromType[] obj) {
     return (cast(RetType[]) obj)[0];
 }
 
-private static void* getSymbolImplementation(string symbolName) {
-    import provision.symbols;
-    return lookupSymbol(symbolName);
-}
-
 class LoaderException: Exception {
     this(string message, string file = __FILE__, size_t line = __LINE__) {
         super("Cannot load library: " ~ message, file, line);
@@ -390,7 +597,7 @@ class LoaderException: Exception {
 }
 
 class UndefinedSymbolException: Exception {
-    this(string file = __FILE__, size_t line = __LINE__) {
-        super("An undefined symbol has been called!", file, line);
+    this(string symbol, string file = __FILE__, size_t line = __LINE__) {
+        super(format!"An undefined symbol has been called: %s."(symbol), file, line);
     }
 }
